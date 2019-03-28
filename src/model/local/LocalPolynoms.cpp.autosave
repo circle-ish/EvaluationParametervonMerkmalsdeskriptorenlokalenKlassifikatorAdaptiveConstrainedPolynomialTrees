@@ -1,0 +1,955 @@
+#include "model/local/LocalPolynoms.h"
+#include "model/local/GlobalDefinitions.h"
+#include "model/GlobalConstants.h"
+#include "model/CmdInputMapping.h"
+
+log4cxx::LoggerPtr faceAnalysis::LocalPolynoms::logger(
+    log4cxx::Logger::getLogger("CPT.models.training.polynomTrainer"));
+
+/** see GlobalDefinitions.h */
+std::string faceAnalysis::outputFile;
+int faceAnalysis::PATCH_RADIUS;
+int faceAnalysis::PATCH;
+int faceAnalysis::PATCH_LEFT_HALF;
+double faceAnalysis::retainVal;
+
+cv::Size faceAnalysis::cellSize;
+cv::Size faceAnalysis::blockSize;
+cv::Size faceAnalysis::blockOverlap;
+int faceAnalysis::binNo;
+bool faceAnalysis::useSign;
+int faceAnalysis::offsetNo;
+bool faceAnalysis::cohog;
+
+int faceAnalysis::ringNo;
+bool faceAnalysis::half;
+
+int faceAnalysis::verbosity;
+int faceAnalysis::no;
+
+faceAnalysis::LocalPolynoms::LocalPolynoms(
+        const boost::property_tree::ptree configuration,
+        const std::vector<int> landmarks_to_model
+        ) {
+
+    configuration_ = configuration;
+    landmarks_to_model_ = landmarks_to_model;
+    std::string classifier_string = configuration.get<std::string>("classifier.name");
+    classifier_type_ = faceAnalysis::CmdInputMapping::GetClassifierType(classifier_string);
+    if (classifier_type_ == CLASSIFIER_INIT) {
+        LOG4CXX_ERROR(logger, "unknown classifier type " << classifier_string << " -- EXIT");
+        exit(-1);
+    }
+
+    std::stringstream s;
+    s << configuration.get<std::string>("training.outputFolder")
+      << configuration.get<std::string>("training.subFolder");
+    path_to_save_location_ = s.str().c_str();
+    relative_path_to_save_location_ = "poly.data";
+
+    gauss_.initGauss((GAUSS_RADIUS * 2) + 1);
+}
+
+void faceAnalysis::LocalPolynoms::Train(const Dataset data) {
+    LOG4CXX_INFO(logger, "____________________________________start training____________________________________"
+               << "\nParams: mrlbp " << ((USE_MRLBP & useFeature) != 0)
+               << "; hog " << ((USE_HOG & useFeature) != 0)
+               << "; cohog " << ((USE_COHOG & useFeature) != 0)
+               << "; patch_radius " << PATCH_RADIUS
+               << "; cs " << cellSize << "; bs " << blockSize
+               << "; bo " << blockOverlap << "; bn " << binNo
+               << "; of " << offsetNo << "; pca " << APPLY_PCA);
+
+  random_negative_examples_total_ =
+      configuration_.get<int>("training.negativeExamplesPerImage");
+  sort_polynom_ = configuration_.get<bool>("training.sortPoly");
+  int offset_for_testing = 0;
+  int landmark_index = 0 + offset_for_testing;
+
+  std::stringstream path_to_save_stream;
+  path_to_save_stream << path_to_save_location_ << "/";
+  boost::filesystem::path dir(path_to_save_stream.str());
+
+  int time = 0, tick;
+  for (
+       std::vector<int>::const_iterator landmarkItr = landmarks_to_model_.begin() + offset_for_testing;
+       landmarkItr != landmarks_to_model_.end();
+       ++landmarkItr
+       ) {
+
+      landmark_index++;
+      int point_counter = *landmarkItr;
+
+      try {
+          generateLocalTrainData(
+                  data,
+                  point_counter,
+                  landmarks_to_model_.size(),
+                  landmark_index
+                  );
+      } catch (std::string message) {
+          throw message;
+      }
+
+      if (!(boost::filesystem::exists(dir) || boost::filesystem::create_directory(dir))) {
+          LOG4CXX_ERROR(logger, "Could not create directory " << path_to_save_stream.str());
+      }
+
+      /** perform pca if set;
+        * get and store eigenvalues, eigenvectors, mean
+        * perform dimension reduction on c_ */
+      cv::Mat c_new;
+
+      if (APPLY_PCA) {
+          LOG4CXX_INFO(logger, "apply pca");
+          cv::PCA pca(c_, cv::Mat(), CV_PCA_DATA_AS_ROW, faceAnalysis::retainVal);
+          int newDim = pca.eigenvalues.rows;
+
+          cv::Mat eigenval,eigenvec,mean, eigen;
+          eigen.create(c_.rows, newDim, c_.type());
+          pca.project(c_ , eigen);
+
+//          double max, max_new, min_new;
+//          cv::minMaxLoc(c_, &min_new, &max);
+//          cv::minMaxLoc(eigen, &min_new, &max_new);
+//          eigen.convertTo(
+//                      c_new,
+//                      eigen.type(),
+//                      max / (max_new - min_new),
+//                      -max * min_new / (max_new - min_new)
+//                      );
+
+          mean=pca.mean.clone();
+          eigenval=pca.eigenvalues.clone();
+          eigenvec=pca.eigenvectors.clone();
+
+
+          /** save eigenvector matrix */
+          std::stringstream s;
+          s << path_to_save_stream.str() << "eigen" << point_counter << ".xml";
+          LOG4CXX_INFO(logger, "Save eigenvectors to " << s.str());
+          cv::FileStorage fs(s.str(), cv::FileStorage::WRITE);
+          fs << "val" << eigenval << "vec" << eigenvec << "mean" << mean;
+          fs.release();
+
+          /** get greatest Eigenvalues */
+          std::map<double, int> m;
+          for (int i = 0; i < eigenval.rows; ++i) {
+              m[eigenval.at<double>(i, 0)] = i; /** sorts automatically */
+          }
+
+          /** select eigenvectors*/
+          for (int i = 0; i < newDim; ++i) {
+              std::map<double, int>::iterator it = m.begin();
+              ++it;
+          }
+
+          c_new = eigen;
+          if (verbosity > 3) std::cout << c_.size() << " c_new:" << c_new.size() << " eigenval:" << eigenval.size() << " eigenvec:" << eigenvec.size() << " mean=" << mean.size() << std::endl;
+      } else {
+          c_new = c_;
+      }
+
+      /** train and save polynom */
+        Polynom polynom(classifier_type_, sort_polynom_, point_counter);
+      tick = cv::getTickCount();
+      polynom.Train(c_new, y_);
+      time += cv::getTickCount() - tick;
+
+      std::stringstream fullPath;
+      fullPath << path_to_save_stream.str() << relative_path_to_save_location_<< "." << point_counter;
+      LOG4CXX_INFO(logger, "Saving polynom to " << path_to_save_stream.str());
+      polynom.Save(fullPath.str());
+
+    c_.release();
+    y_.release();
+    }
+
+  /** save time for training */
+  std::ofstream output;
+  path_to_save_stream << "time";
+  output.open(path_to_save_stream.str().c_str());
+  output << "timeForTraining:" << time / (double)cv::getTickFrequency() << std::endl;
+  output.close();
+}
+
+void faceAnalysis::LocalPolynoms::Save() {
+    std::stringstream path_to_save_stream;
+    path_to_save_stream << path_to_save_location_ << "/";
+    try {
+        boost::filesystem::path dir(path_to_save_stream.str());
+        if (!(boost::filesystem::exists(dir) || boost::filesystem::create_directory(dir))) {
+            LOG4CXX_ERROR(logger, "Could not create directory " << path_to_save_stream.str());
+        }
+    } catch (std::exception ex) {
+        LOG4CXX_ERROR(logger, "BOOST-exception: " << ex.what());
+        return;
+    }
+    for (
+         std::map<int, Polynom>::const_iterator mapItr = polynoms_.begin();
+         mapItr != polynoms_.end();
+         ++mapItr
+         ) {
+
+        int polynom_id = mapItr->first;
+        Polynom poly = mapItr->second;
+
+        std::stringstream fullPath;
+        fullPath << path_to_save_stream.str() << relative_path_to_save_location_<< "." << polynom_id;
+        if (verbosity > 3) LOG4CXX_INFO(logger, "Saving polynom to " << path_to_save_stream.str());
+        poly.Save(fullPath.str());
+    }
+}
+
+void faceAnalysis::LocalPolynoms::Load(std::string path)
+{
+  boost::regex expression("poly.data.[0-9]*");
+  boost::filesystem::path polyPath(path);
+  boost::filesystem::directory_iterator end_iter;
+  if (exists(polyPath) && is_directory(polyPath))
+    {
+      for (boost::filesystem::directory_iterator dir_iter(polyPath);
+           dir_iter != end_iter; ++dir_iter)
+        {
+          if (is_regular_file(dir_iter->status()))
+            {
+              boost::cmatch what;
+              if (boost::regex_match(dir_iter->path().filename().string().c_str(),
+                                     what, expression ))
+                {
+                  Polynom poly(dir_iter->path().string());
+                  allPolynoms_[poly.id()] = poly;
+                }
+            }
+        }
+    } else {
+      LOG4CXX_WARN(logger, "no polynoms to load; path does not exist " << path);
+  }
+}
+
+void faceAnalysis::LocalPolynoms::generateLocalTrainData(
+        const Dataset &data,
+        int point_counter,
+        int size_landmarks_to_model,
+        int landmark_index
+        ) {
+
+  verbosity = 0;
+  if (verbosity > 3) LOG4CXX_INFO(logger, "***** GENERATE TRAIN DATA *****");
+  LOG4CXX_INFO(logger, "Polynom "
+               << landmark_index << "/" << size_landmarks_to_model
+               << " for point " << point_counter
+               );
+
+  c_.reserve(size_landmarks_to_model * std::pow(GAUSS_RADIUS * 2 + 1, 2));
+  int imCounter = 0;
+  for (
+       Dataset::const_iterator itr = data.begin();
+       itr != data.end();
+       ++itr
+       ) {
+
+      ++imCounter; if ((useFeature & USE_COHOG) != 0 && imCounter == 25) break;
+
+      //////////////////////////////////////////////
+      
+      path_to_bounding_boxes_ = "/home/bot/netbeans/NetBeansProjects/ba/lfpw_testset_opencv_bb";
+      bounding_boxes_ = datahandler.ExtractFaceBoxes(dataset_);
+      
+      bounding_boxes_ = datahandler.ReadBoundingBoxes(
+                  list_of_all_data,
+                  path_to_bounding_boxes_,
+                  true
+                  );
+      cv::Rect detector_output = bounding_boxes_.at(counter);
+      
+      double scale_factor = NORM_FACE_WIDTH / (double)(PATCH + detector_output.width);
+      cv::Mat scaled_image;
+      resize(ground_truth.first, scaled_image,
+             cv::Size(scale_factor * ground_truth.first.cols,
+                      scale_factor * ground_truth.first.rows));
+      cv::Rect scaled_rect;
+      scaled_rect.x = std::max(0, (int)round(scale_factor * detector_output.x) - PATCH_LEFT_HALF);
+      scaled_rect.y = std::max(0, (int)round(scale_factor * detector_output.y) - PATCH_LEFT_HALF);
+      scaled_rect.width = std::min((int)NORM_FACE_WIDTH + scaled_rect.x, scaled_image.cols) - scaled_rect.x;
+      scaled_rect.height = std::min((int)round(scale_factor * detector_output.height) + scaled_rect.y, scaled_image.rows) - scaled_rect.y;
+      cv::Mat detection_image = scaled_image(scaled_rect);
+      ///////////////////////////////////////////////
+      
+      
+      
+      
+      DatasetExample sample = *itr;
+      double x = round(sample.second.at<float>(point_counter, 0));
+      double y = round(sample.second.at<float>(point_counter, 1));
+      cv::Mat sampleMat = sample.first;
+      cv::Mat sampleConverted, grayscale_of_part;
+
+      double rectangleX = std::max(0.0, x - (PATCH_LEFT_HALF + 1) - GAUSS_RADIUS);
+      double rectangleY = std::max(0.d, y - (PATCH_LEFT_HALF + 1) - GAUSS_RADIUS);
+      double rectangleXEnd = std::min((double)sampleMat.cols, x + PATCH_RADIUS + GAUSS_RADIUS);
+      double rectangleYEnd = std::min((double)sampleMat.rows, y + PATCH_RADIUS + GAUSS_RADIUS);
+
+      cv::Rect conversionRect(
+                  rectangleX,
+                  rectangleY,
+                  rectangleXEnd - rectangleX,
+                  rectangleYEnd - rectangleY
+                  );
+      /** because a feature vector of different length would be the result: */
+      if ((conversionRect.height < PATCH + 2 * GAUSS_RADIUS) || (conversionRect.width < PATCH + 2 * GAUSS_RADIUS)) {
+          std::stringstream error;
+          error << "considered area is smaller than usual: " << conversionRect;
+          LOG4CXX_INFO(logger, error.str());
+          continue;
+      }
+      sampleMat(conversionRect).convertTo(sampleConverted, SRC_CV_TYPE);
+
+      /** build GAUSS_RADIUS * 2 + 1 feature vectors from a area with size PATCH */
+      if (verbosity > 0) std::cout << "im: " << imCounter << std::endl;
+      std::vector<std::vector<BIN_TYPE> > features;
+      try {
+          LocalPolynoms::buildFeatureVectors(
+                  sampleConverted,
+                  features,
+                  useFeature
+                  );
+      } catch (std::string message) {
+          throw message;
+      }
+
+      /** feat vector to c_ */
+      std::vector<std::vector<BIN_TYPE> >::const_iterator it = features.begin();
+      for (int y = -GAUSS_RADIUS; y < GAUSS_RADIUS + 1; ++y) {
+          for (int x = -GAUSS_RADIUS; x < GAUSS_RADIUS + 1; ++x) {
+              cv::Mat tmp(*it);
+
+              if (c_.data) {
+                  c_.push_back(tmp.reshape(0, 1));
+              } else {
+                  c_ = tmp.reshape(0, 1);
+                  c_.reserve(data.size() * (std::pow(GAUSS_RADIUS * 2 + 1, 2) + random_negative_examples_total_));
+              }
+              y_.push_back(gauss_.gauss2D(x, y));
+          }
+      }
+      /** negative examples */
+      for (int j = 0; j < random_negative_examples_total_; j++) {
+          verbosity = 0;
+          if (verbosity > 0) std::cout << "im: " << imCounter << ", negEx:" << j << std::endl;
+          int rand_row_number = 0;
+          int rand_col_number = 0;
+
+          cv::Rect face_rect = dataHandler_.ExtractFaceBox(sample);
+          if (verbosity > 3) std::cout << "negEx: faceRect=" << face_rect << " imcv::Size=" << sampleMat.size() << std::endl;
+          double face_rect_min_x = face_rect.x;
+          double face_rect_min_y = face_rect.y;
+          double face_rect_max_x = face_rect.x + face_rect.width;
+          double face_rect_max_y = face_rect.y + face_rect.height;
+
+          rand_row_number = -1;
+          rand_col_number = -1;
+
+          while ((rand_row_number < face_rect_min_y + PATCH_LEFT_HALF)
+                 || (rand_row_number + PATCH_RADIUS > face_rect_max_y)
+                 || (rand_col_number < face_rect_min_x + PATCH_LEFT_HALF)
+                 || (rand_col_number + PATCH_RADIUS > face_rect_max_x)
+                 || ((rand_row_number > (y - PATCH))
+                     && (rand_row_number < (y + PATCH))
+                     && (rand_col_number > (x - PATCH))
+                     && (rand_col_number < (x + PATCH)))
+                 ) {
+
+              rand_row_number = PATCH_RADIUS + rand() % (sampleMat.rows - PATCH_RADIUS - PATCH_RADIUS);
+              rand_col_number = PATCH_RADIUS + rand() % (sampleMat.cols - PATCH_RADIUS - PATCH_RADIUS);
+          }
+          if (verbosity > 3) std::cout << "negEx: rand_row=" << rand_row_number << ", rand_col=" << rand_col_number << std::endl;
+
+          cv::Rect current_face_detection(
+                      rand_col_number - PATCH_LEFT_HALF,
+                      rand_row_number - PATCH_LEFT_HALF,
+                      PATCH,
+                      PATCH
+                      );
+          if (verbosity > 3) std::cout << "negEx=" << j << ": patch=" << current_face_detection << " for im=" << imCounter << " imcv::Size=" << sampleMat.size() << std::endl;
+          sampleMat(current_face_detection).convertTo(grayscale_of_part, SRC_CV_TYPE);
+
+          std::vector<std::vector<double> > learnMat;
+          LocalPolynoms::buildFeatureVectors(
+                      grayscale_of_part,
+                      learnMat,
+                      useFeature
+                      );
+
+          for (
+               std::vector<std::vector<double> >::const_iterator it = learnMat.begin();
+               it != learnMat.end();
+               ++it
+               ) {
+
+              y_.push_back(NEGATIVE_VALUE);
+              cv::Mat tmp(*it);
+              c_.push_back(tmp.reshape(0, 1));
+          }
+      }
+  }
+}
+
+void faceAnalysis::LocalPolynoms::initAnswer(int polynom_id) {
+    allPolynoms_[polynom_id].InitAnswer(feature_map_.size(), feature_map_[0].size());
+}
+
+bool faceAnalysis::LocalPolynoms::IsAnswerMapInitialized(int polynom_id)
+{
+  return allPolynoms_[polynom_id].is_initialized();
+}
+
+double faceAnalysis::LocalPolynoms::getAnswer(int polynom_id, int row_id, int col_id)
+{
+  return allPolynoms_[polynom_id].answer_map_element(row_id, col_id);
+}
+
+void faceAnalysis::LocalPolynoms::DrawAnswerMap(int polynom_id)
+{
+  allPolynoms_[polynom_id].DrawAnswerMap();
+}
+
+void faceAnalysis::LocalPolynoms::Update(
+        int polynom_id,
+        int x,
+        int y,
+        double value,
+        double weight
+        ) {
+
+    allPolynoms_[polynom_id].Update(feature_map_.at(x).at(y), value,weight);
+}
+
+cv::Point2i faceAnalysis::LocalPolynoms::GetMaxValuePosition(int polynom_id) {
+  return allPolynoms_[polynom_id].maxValuePosition();
+}
+
+cv::Point2i faceAnalysis::LocalPolynoms::GetMaxValuePositionBySum(int polynom_id) {
+  return allPolynoms_[polynom_id].maxValuePositionBySum();
+}
+
+void faceAnalysis::LocalPolynoms::GenerateSumAnswerForPolynom(int polynom_id) {
+    allPolynoms_[polynom_id].GenerateSumAnswer();
+}
+
+double faceAnalysis::LocalPolynoms::GenerateAnswerForPolynom(
+        int polynom_id,
+        int row_id,
+        int col_id
+        ) {
+
+    return allPolynoms_[polynom_id].GenerateAnswer(feature_map_.at(row_id).at(col_id), row_id, col_id);
+}
+
+int faceAnalysis::LocalPolynoms::Size()
+{
+  return allPolynoms_.size();
+}
+
+void faceAnalysis::LocalPolynoms::SetCurrentImage(const cv::Mat &image) {
+    image.convertTo(current_image_, SRC_CV_TYPE);
+}
+
+void faceAnalysis::LocalPolynoms::ClearAllPolynoms() {
+    allPolynoms_.clear();
+}
+
+void faceAnalysis::LocalPolynoms::FreeAllPolynoms() {
+    for (
+         std::map<int, Polynom>::iterator itr =  allPolynoms_.begin();
+         itr !=  allPolynoms_.end();
+         ++itr
+         ) {
+
+        itr->second.DeleteAnswer();
+    }
+}
+
+void faceAnalysis::LocalPolynoms::FreeFeatureMap() {
+    while (!feature_map_.empty()) {
+        std::vector<std::vector<double> > sndD = feature_map_.back();
+        while (!sndD.empty()) {
+            sndD.back().clear();
+            sndD.pop_back();
+        }
+        feature_map_.pop_back();
+    }
+}
+
+void faceAnalysis::LocalPolynoms::InitFeatureMap(
+        const int image_rows,
+        const int image_cols
+        ) {
+
+    if (feature_map_.size() != 0) {
+        LocalPolynoms::FreeFeatureMap();
+    }
+
+    std::vector<double> thrdD;
+    feature_map_.reserve(image_rows);
+    for (int r = 0; r < image_rows; ++r) {
+        std::vector<std::vector<double> > vec;
+        vec.reserve(image_cols);
+
+        for (int c = 0; c < image_cols; ++c) {
+            vec.push_back(thrdD);
+        }
+        feature_map_.push_back(vec);
+    }
+}
+
+void faceAnalysis::LocalPolynoms::SetElementFeatureMap(
+        const int row_id,
+        const int col_id,
+        const int depth_id,
+        const double value
+        ) {
+
+    feature_map_.at(row_id).at(col_id).at(depth_id) = value;
+}
+
+double faceAnalysis::LocalPolynoms::GetElementFeatureMap(
+        int row_id,
+        int col_id,
+        int depth_id
+        ) const {
+
+    return feature_map_.at(row_id).at(col_id).at(depth_id);
+}
+
+void faceAnalysis::LocalPolynoms::ExtractFeatures(std::vector<std::vector<double> > &features) {
+    if (verbosity > 3) LOG4CXX_INFO(logger, "ExtractFeatures");
+    timeHOG = timeCoHOG = timeMrLBP = timeGrad = timeLBP = 0;
+
+    try {
+        LocalPolynoms::buildFeatureVectors(
+                current_image_,
+                features,
+                useFeature
+                );
+    } catch (std::string message) {
+        throw message;
+    }
+}
+void faceAnalysis::LocalPolynoms::GenerateFeatureMap(
+        std::vector<std::vector<double> > &features,
+        const int polyDegree,
+        const int landmark_index,
+        std::string eigenPath
+        ) {
+
+    if (verbosity > 3) LOG4CXX_INFO(logger, "GenerateFeatureMap");
+    /** perform dimension reduction on feature vector;
+     * load eigenvectors */
+    cv::PCA pca;
+    if (APPLY_PCA) {
+        if (verbosity > 3) LOG4CXX_INFO(logger, "apply pca");
+        cv::Mat eigenval, eigenvec, mean;
+        std::stringstream s;
+        s << eigenPath << "eigen" << landmark_index << ".xml";
+        cv::FileStorage fs(s.str(), cv::FileStorage::READ);
+        fs["val"] >> eigenval;
+        fs["vec"] >> eigenvec;
+        fs["mean"] >> mean;
+
+        if (verbosity > 4) std::cout << " eigenval:" << eigenval.size() << " eigenvec:" << eigenvec.size() << " mean=" << mean.size() << std::endl;
+        pca.mean = mean.clone();
+        pca.eigenvalues = eigenval.clone();
+        pca.eigenvectors = eigenvec.clone();
+        fs.release();
+    }
+
+    std::vector<std::vector<double> >::iterator it_feat = features.begin();
+    for (int y = PATCH_LEFT_HALF; y < current_image_.rows - PATCH_RADIUS; ++y) {
+        for (int x = PATCH_LEFT_HALF; x < current_image_.cols - PATCH_RADIUS; ++x) {
+            std::vector<double> res;
+            cv::Mat tmp(1, it_feat->size(), CV_64F, &(*it_feat).front());
+            cv::Mat feat;
+
+            if (APPLY_PCA) {
+                pca.project(tmp, feat);
+//                double max, min_new, max_new;
+//                cv::minMaxLoc(tmp, &min_new, &max);
+//                cv::minMaxLoc(feat, &min_new, &max_new);
+//                feat.convertTo(
+//                            feat,
+//                            feat.type(),
+//                            max / (max_new - min_new),
+//                            -max * min_new / (max_new - min_new)
+//                            );
+
+                res = feat;
+            } else {
+                feat = tmp;
+                res = *it_feat;
+            }
+
+            /** calculate higher polynomial degree */
+            for (int p = 2; p <= polyDegree; ++p) {
+                for (
+                     cv::MatConstIterator_<BIN_TYPE> it = feat.begin<BIN_TYPE>();
+                     it != feat.end<BIN_TYPE>();
+                     ++it
+                     ) {
+
+                    res.push_back(std::pow(*it, p));
+                }
+            }
+
+            res.insert(res.begin(), 1.0);
+            feature_map_.at(y).at(x) = res;
+            ++it_feat;
+        }
+    }
+
+    std::stringstream s;
+    s << outputFile << "/time";
+    std::ofstream output;
+    output.open(s.str().c_str());
+    if (timeHOG != 0) output << "timeForHog=" << timeHOG / (double)cv::getTickFrequency() << std::endl;
+    if (timeCoHOG != 0) output << "timeForCoHog=" << timeCoHOG / (double)cv::getTickFrequency() << std::endl;
+    if (timeMrLBP != 0) output << "timeForMrLBP=" << timeMrLBP / (double)cv::getTickFrequency() << std::endl;
+    if (timeGrad != 0) output << "timeForGrad=" << timeGrad / (double)cv::getTickFrequency() << std::endl;
+    if (timeLBP != 0) output << "timeForLBP=" << timeLBP / (double)cv::getTickFrequency() << std::endl;
+    output.close();
+}
+
+void faceAnalysis::LocalPolynoms:: buildFeatureVectors(
+            const cv::Mat &src,
+            std::vector<std::vector<double> > &features,
+            const int useFeature
+        ) {
+
+    verbosity = 0;
+    patch_feature_.verbosity = 0;
+    cv::Mat binMag;
+    cv::Size cellNo, blockNo;
+    int xShift, yShift, xShiftRight;
+    double tick;
+    if (verbosity > 0) std::cout << "srcsize=" << src.size() << std::endl;
+    if ((useFeature & (USE_HOG | USE_COHOG)) != 0) {
+        if (verbosity > 0) std::cout << "before check->" << std::flush;
+
+        //check..() kann spaeter wahrscheinlich weg
+        //dafuer dann PatchFeatureUtils::calculateCellBlockNumber()
+        try {
+            patch_feature_.checkHOGParameters(
+                        src.size(),
+                        cellNo,
+                        blockNo,
+                        cellSize,
+                        blockSize,
+                        blockOverlap,
+                        binNo,
+                        useSign
+                        );
+            if ((useFeature & USE_COHOG) != 0) {
+                patch_feature_.checkCoHOGParameters(
+                            cellSize,
+                            offsetNo,
+                            xShift,
+                            yShift,
+                            xShiftRight
+                            );
+            }
+            const div_t cellNoInPatchW = std::div(PATCH, cellSize.width);
+            const div_t cellNoInPatchH = std::div(PATCH, cellSize.height);
+            if (cellNoInPatchW.rem != 0 || cellNoInPatchH.rem != 0) {
+                std::stringstream error;
+                error << "patch is not divisible by cellSize";
+                LOG4CXX_ERROR(logger, error.str());
+                throw error.str();
+            }
+            if (cellNoInPatchW.quot < blockSize.width || cellNoInPatchH.quot < blockSize.height) {
+                std::stringstream error;
+                error << "blockSize is bigger than the overall cellNo in a patch";
+                LOG4CXX_ERROR(logger, error.str());
+                throw error.str();
+            }
+            cellNo = cv::Size(cellNoInPatchW.quot, cellNoInPatchH.quot);
+
+            if (src.rows - (cellSize.height - 1) / cellSize.height < blockSize.height
+                    || src.cols - (cellSize.width - 1) / cellSize.width < blockSize.width) {
+                std::stringstream error;
+                error << "minimum present number of cells is smaller than required by blockSize";
+                LOG4CXX_ERROR(logger, error.str());
+                throw error.str();
+            }
+
+            const std::div_t h = std::div((PATCH / cellSize.height - blockSize.height),
+                                                (blockSize.height - blockOverlap.height));
+            const std::div_t w = std::div((PATCH / cellSize.width - blockSize.width),
+                                                (blockSize.width - blockOverlap.width));
+            blockNo = cv::Size(w.quot + 1, h.quot + 1);
+        } catch (std::string message) {
+            LOG4CXX_ERROR(logger, "image size and hog params do not fit\n" << message);
+            throw message;
+        }
+
+        tick = cv::getTickCount();
+
+        binMag.create(src.rows, src.cols, BINMAG_CV_TYPE);
+        binMag.setTo(cv::Scalar(0));
+        cv::Mat borderIm;
+        cv::copyMakeBorder(src, borderIm, 1, 1, 1, 1, cv::BORDER_CONSTANT, 0);
+
+        if (verbosity > 0) std::cout << "before grad->" << std::flush;
+        try {
+            patch_feature_.HOGGradients(
+                        borderIm,
+                        binMag,
+                        useSign,
+                        binNo
+                        );
+        } catch (std::string message) {
+            throw message;
+        }
+
+        if ((useFeature & USE_HOG) != 0) timeHOG = cv::getTickCount() - tick;
+        if ((useFeature & USE_COHOG) != 0) timeCoHOG = cv::getTickCount() - tick;
+
+    }
+    cv::Mat mrlbpChannels[4];
+    cv::Mat mrlbp;
+    if ((useFeature & USE_MRLBP) != 0) {
+        if (verbosity > 0) std::cout << "before mrlbp->" << std::flush;
+
+        tick = cv::getTickCount();
+
+        cv::Mat ret, borderIm;
+        cv::copyMakeBorder(src, borderIm, ringNo, ringNo, ringNo, ringNo, cv::BORDER_REFLECT_101);
+        patch_feature_.MultiRingLBP(
+                    borderIm,
+                    ret,
+                    ringNo,
+                    half
+                    );
+        cv::split(ret, mrlbpChannels);
+        mrlbp = mrlbpChannels[0]/* * ePatternNo * iPatternNo * iPatternNo*/
+                + mrlbpChannels[1] /** iPatternNo * iPatternNo*/
+                + mrlbpChannels[2] //* iPatternNo
+                + mrlbpChannels[3];
+//        cv::imshow("0", split[0]); cv::imshow("1", split[1]); cv::imshow("2", split[2]);
+//        cv::imshow("3", split[3]); cv::waitKey(0);
+
+
+        timeMrLBP = cv::getTickCount() - tick;
+    }
+    cv::Mat grad;
+    if ((useFeature & USE_GRAD) != 0) {
+        tick = cv::getTickCount();
+        cv::Mat borderIm;
+        cv::copyMakeBorder(src, borderIm, 1, 1, 1, 1, cv::BORDER_REFLECT);
+
+        if (verbosity > 0) std::cout << "before grad->" << std::flush;
+        patch_feature_.Grad(borderIm, grad);
+        timeGrad = cv::getTickCount() - tick;
+        if (verbosity > 5) PatchFeatureUtils::showMatrix(grad, "grad");
+    }
+    cv::Mat lbp;
+    if ((useFeature & USE_LBP) != 0) {
+        tick = cv::getTickCount();
+        cv::Mat borderIm;
+        cv::copyMakeBorder(src, borderIm, 1, 1, 1, 1, cv::BORDER_REFLECT);
+
+        if (verbosity > 0) std::cout << "before lbp->" << std::flush;
+        patch_feature_.LBP(borderIm, lbp);
+        timeLBP = cv::getTickCount() - tick;
+    }
+
+    const int roiW = src.cols - PATCH_LEFT_HALF - PATCH_RADIUS;
+    features.resize(roiW * (src.rows - PATCH_LEFT_HALF - PATCH_RADIUS));
+    for (int csY = 0; csY < cellSize.height; ++csY) {
+        for (int csX = 0; csX < cellSize.width; ++csX) {
+            faceAnalysis::MatrixOfMats_t cellBinsHOG;
+            faceAnalysis::MatrixOfMats_t cellBinsCOHOG;
+            cv::Rect patchForCells;
+            cv::Size cells;
+            if ((useFeature & (USE_HOG | USE_COHOG)) != 0) {
+                const int cellNoW = (src.cols - csX) / cellSize.width;
+                const int cellNoH = (src.rows - csY) / cellSize.height;
+                cells = cv::Size(cellNoW, cellNoH);
+                if (cells.width < blockSize.width || cells.height < blockSize.height
+                        || src.cols - csX < PATCH || src.rows - csY < PATCH) {
+                    break;
+                }
+                patchForCells = cv::Rect(
+                            csX,
+                            csY,
+                            cellSize.width * cellNoW,
+                            cellSize.height * cellNoH
+                            );
+            }
+            if (verbosity > 0) std::cout << src.cols << "binning(csY=" << csY << ",csX=" << csX << ")->" << std::flush;
+            if ((useFeature & USE_HOG) != 0) {
+                tick = cv::getTickCount();
+
+                patch_feature_.HOGBinning(
+                            binMag(patchForCells),
+                            cellBinsHOG,
+                            cellSize,
+                            cells,
+                            binNo
+                            );
+
+                timeHOG += cv::getTickCount() - tick;
+            }
+            if ((useFeature & USE_COHOG) != 0) {
+                tick = cv::getTickCount();
+                patch_feature_.CoHOGBinning(
+                            binMag(patchForCells),
+                            cellBinsCOHOG,
+                            cellSize,
+                            cells,
+                            binNo,
+                            offsetNo,
+                            xShift,
+                            yShift,
+                            xShiftRight
+                            );
+
+                timeCoHOG += cv::getTickCount() - tick;
+            }
+            if (verbosity > 0) std::cout << "binning finished" << std::endl;
+
+            for (
+                 int y = csY;
+                 y < src.rows - (PATCH - 1);
+                 y += cellSize.height
+                 ) {
+
+                for (
+                     int x = csX;
+                     x < src.cols - (PATCH - 1);
+                     x += cellSize.width
+                     ) {
+
+                    cv::Mat feat;
+                    cv::Rect patchHOG(
+                                x / cellSize.width,
+                                y / cellSize.height,
+                                cellNo.width,
+                                cellNo.height
+                                );
+                    if (verbosity > 0) std::cout << "double for entered->" << std::flush;
+                    if ((useFeature & USE_HOG) != 0) {
+                        tick = cv::getTickCount();
+                        if (verbosity > 0) std::cout << "comp hog blocks(x=" << x << ", y=" << y << ")->" << std::flush;
+
+                        faceAnalysis::MatrixOfMats_t cellBinsHOGPatch;
+                        PatchFeatureUtils::getMatrixOfMatsRoi(
+                                    cellBinsHOG,
+                                    cellBinsHOGPatch,
+                                    patchHOG
+                                    );
+                        faceAnalysis::MatrixOfMats_t blocksHOG;
+                        patch_feature_.HOGComputeBlocks(
+                                    blocksHOG,
+                                    cellBinsHOGPatch,
+                                    blockNo,
+                                    blockSize,
+                                    blockOverlap
+                                    );
+                        cv::Mat featHOG;
+
+                        PatchFeatureUtils::BinPatching(
+                                    blocksHOG,
+                                    featHOG,
+                                    SHAPE_VERTICAL
+                                    );
+                        feat.push_back(featHOG);
+
+                        timeHOG += cv::getTickCount() - tick;
+                        PatchFeatureUtils::freeMatrixOfMats(cellBinsHOGPatch);
+                        PatchFeatureUtils::freeMatrixOfMats(blocksHOG);
+                    }
+                    if ((useFeature & USE_COHOG) != 0) {
+                        tick = cv::getTickCount();
+
+                        if (verbosity > 0) std::cout << "cohog momRoi->" << std::flush;
+                        faceAnalysis::MatrixOfMats_t cellBinsCOHOGPatch;
+                        PatchFeatureUtils::getMatrixOfMatsRoi(
+                                    cellBinsCOHOG,
+                                    cellBinsCOHOGPatch,
+                                    patchHOG
+                                    );
+                        if (verbosity > 0) {
+                            std::cout << "blockingPatch: "<<  patchHOG << " "
+                                      << cellBinsCOHOGPatch.size() << "x"
+                                      << cellBinsCOHOGPatch[0].size() << std::endl;
+                        }
+                        faceAnalysis::MatrixOfMats_t blocksCOHOG;
+                        if (verbosity > 0) std::cout << "comp cohog blocks->" << std::flush;
+                        patch_feature_.HOGComputeBlocks(
+                                    blocksCOHOG,
+                                    cellBinsCOHOGPatch,
+                                    blockNo,
+                                    blockSize,
+                                    blockOverlap
+                                    );
+                        cv::Mat featCOHOG;
+                        if (verbosity > 0) std::cout << "binpatching->" << std::flush;
+                        PatchFeatureUtils::BinPatching(
+                                    blocksCOHOG,
+                                    featCOHOG,
+                                    SHAPE_VERTICAL
+                                    );
+
+                        if (verbosity > 0) std::cout << "push to feat->" << std::flush;
+                        feat.push_back(featCOHOG);
+
+                        timeCoHOG += cv::getTickCount() - tick;
+                        PatchFeatureUtils::freeMatrixOfMats(cellBinsCOHOGPatch);
+                        PatchFeatureUtils::freeMatrixOfMats(blocksCOHOG);
+                    }
+                    cv::Rect patch(x, y, PATCH, PATCH);
+                    if ((useFeature & USE_MRLBP) != 0) {
+
+                        if (verbosity > 0) std::cout << "patch mrlbp->" << std::flush;
+                        tick = cv::getTickCount();
+
+                        cv::Mat dimZero = mrlbpChannels[0](patch).clone();
+                        cv::Mat dimOne = mrlbpChannels[1](patch).clone();
+                        cv::Mat dimTwo = mrlbpChannels[2](patch).clone();
+                        cv::Mat dimThree = mrlbpChannels[3](patch).clone();
+                        feat.push_back(dimZero.reshape(0, dimZero.total()));
+                        feat.push_back(dimOne.reshape(0, dimOne.total()));
+                        feat.push_back(dimTwo.reshape(0, dimTwo.total()));
+                        feat.push_back(dimThree.reshape(0, dimThree.total()));
+
+//                        feat.push_back(mrlbp(patch).reshape(0, mrlbp(patch).total()));
+
+                        timeMrLBP += cv::getTickCount() - tick;
+                    }
+                    if ((useFeature & USE_LBP) != 0) {
+                        tick = cv::getTickCount();
+                        if (verbosity > 0) std::cout << "patch lbp->" << std::flush;
+                        cv::Mat tmp = lbp(patch).clone();
+                        feat.push_back(tmp.reshape(0, tmp.total()));
+                        timeLBP += cv::getTickCount() - tick;
+                    }
+                    if ((useFeature & USE_GRAD) != 0) {
+                        tick = cv::getTickCount();
+                        if (verbosity > 0) std::cout << "patch grad->" << std::flush;
+                        cv::Mat tmp = grad(patch).clone();
+                        feat.push_back(tmp.reshape(0, tmp.total()));
+                        timeGrad += cv::getTickCount() - tick;
+                    }
+                    const int idx = y * roiW + x;
+                    if (verbosity > 4) std::cout << "feat=" << feat.size() << std::endl;
+                    features.at(idx) = feat;
+                }
+            }
+            PatchFeatureUtils::freeMatrixOfMats(cellBinsHOG);
+            PatchFeatureUtils::freeMatrixOfMats(cellBinsCOHOG);
+        }
+    }
+    if (verbosity > 0) std::cout << "done" << std::endl;
+}
+
+//void
